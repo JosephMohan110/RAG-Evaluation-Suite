@@ -1,0 +1,7 @@
+{"id":"refund-window","query":"How long after delivery can I request a refund?","expected_answerable":true,"relevant_sources":["refund_policy.txt"],"expected_terms":["30 calendar days"]}
+{"id":"refund-condition","query":"What condition must an item meet to qualify for a refund?","expected_answerable":true,"relevant_sources":["refund_policy.txt"],"expected_terms":["unused","receipt"]}
+{"id":"subscription-exclusion","query":"Can I get a refund for an activated digital subscription?","expected_answerable":true,"relevant_sources":["refund_policy.txt"],"expected_terms":["not refundable"]}
+{"id":"enable-two-step","query":"Where do I turn on two-step verification?","expected_answerable":true,"relevant_sources":["account_security.txt"],"expected_terms":["Account Settings","Security"]}
+{"id":"delivery-time","query":"How long does standard shipping take after dispatch?","expected_answerable":true,"relevant_sources":["shipping_policy.txt"],"expected_terms":["3 to 5 business days"]}
+{"id":"password-safety","query":"Will support ever ask me to send my password?","expected_answerable":true,"relevant_sources":["account_security.txt"],"expected_terms":["never asks","password"]}
+{"id":"unknown-market-cap","query":"What is the market capitalization of Northstar Demo Store?","expected_answerable":false,"relevant_sources":[],"expected_terms":[]}

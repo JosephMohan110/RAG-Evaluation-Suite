@@ -1,0 +1,23 @@
+[
+  {
+    "chunk_id": 0,
+    "source": "account_security.txt",
+    "page": null,
+    "chunk_index": 0,
+    "text": "Northstar Demo Store account security\n\nCustomers can enable two-step verification from Account Settings under Security. If a customer loses access to their verification device, they should contact support and provide the account email for identity verification. Support never asks customers to send their password."
+  },
+  {
+    "chunk_id": 0,
+    "source": "refund_policy.txt",
+    "page": null,
+    "chunk_index": 0,
+    "text": "Northstar Demo Store refund policy\n\nCustomers may request a refund within 30 calendar days after delivery. The item must be unused and returned with its receipt. Activated digital subscriptions are not refundable."
+  },
+  {
+    "chunk_id": 0,
+    "source": "shipping_policy.txt",
+    "page": null,
+    "chunk_index": 0,
+    "text": "Northstar Demo Store shipping policy\n\nStandard shipping usually takes 3 to 5 business days after dispatch. Customers can find the tracking link in the dispatch confirmation email. The store currently ships within the fictional Northstar region only."
+  }
+]

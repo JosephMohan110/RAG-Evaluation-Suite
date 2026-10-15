@@ -1,0 +1,305 @@
+{
+  "schema_version": 1,
+  "run_at_utc": "2026-10-15T11:00:51.906195+00:00",
+  "dataset": {
+    "path": "C:\\Users\\LENOVO\\Desktop\\LLM\\intern task\\RAG Evaluation Suite\\data\\eval_cases.jsonl",
+    "sha256": "0c15f90198ac830ccc7f94e5b9b8e8364d9c534df3f07a7e4acbc6942fcdca37",
+    "case_count": 7
+  },
+  "configuration": {
+    "top_k": 5,
+    "min_score": 0.25,
+    "embedding_model": "all-MiniLM-L6-v2"
+  },
+  "metrics": {
+    "case_count": 7,
+    "answerable_case_count": 6,
+    "unanswerable_case_count": 1,
+    "source_hit_at_k": {
+      "successes": 6,
+      "total": 6,
+      "rate": 1.0,
+      "wilson_95_ci": [
+        0.6096657120978346,
+        1.0
+      ]
+    },
+    "mean_reciprocal_rank_at_k": 1.0,
+    "mean_source_precision_at_k": 0.19999999999999998,
+    "mean_source_recall_at_k": 1.0,
+    "answer_behavior_accuracy": {
+      "successes": 6,
+      "total": 7,
+      "rate": 0.8571428571428571,
+      "wilson_95_ci": [
+        0.4868721707256811,
+        0.9743203756552565
+      ]
+    },
+    "answerable_answer_rate": {
+      "successes": 6,
+      "total": 6,
+      "rate": 1.0,
+      "wilson_95_ci": [
+        0.6096657120978346,
+        1.0
+      ]
+    },
+    "no_answer_accuracy": {
+      "successes": 0,
+      "total": 1,
+      "rate": 0.0,
+      "wilson_95_ci": [
+        0.0,
+        0.7934506856227626
+      ]
+    },
+    "valid_citation_coverage": {
+      "successes": 6,
+      "total": 6,
+      "rate": 1.0,
+      "wilson_95_ci": [
+        0.6096657120978346,
+        1.0
+      ]
+    },
+    "citation_id_validity_rate": {
+      "successes": 7,
+      "total": 7,
+      "rate": 1.0,
+      "wilson_95_ci": [
+        0.6456695649333126,
+        1.0
+      ]
+    },
+    "mean_cited_source_precision": 0.7142857142857143,
+    "mean_expected_term_coverage": 1.0
+  },
+  "cases": [
+    {
+      "case_id": "refund-window",
+      "expected_answerable": true,
+      "predicted_answerable": true,
+      "answer_behavior_correct": true,
+      "retrieval_hit_at_k": true,
+      "reciprocal_rank_at_k": 1.0,
+      "retrieval_precision_at_k": 0.2,
+      "retrieval_recall_at_k": 1.0,
+      "valid_citation_coverage": true,
+      "citation_ids_valid": true,
+      "cited_source_precision": 0.5,
+      "expected_term_coverage": 1.0,
+      "matched_expected_terms": [
+        "30 calendar days"
+      ],
+      "retrieved": [
+        {
+          "source": "refund_policy.txt",
+          "page": null,
+          "score": 0.5791,
+          "citation_id": "S1"
+        },
+        {
+          "source": "shipping_policy.txt",
+          "page": null,
+          "score": 0.396,
+          "citation_id": "S2"
+        }
+      ],
+      "answer": "Northstar Demo Store refund policy\n\nCustomers may request a refund within 30 calendar days after delivery. [S1] Northstar Demo Store shipping policy\n\nStandard shipping usually takes 3 to 5 business days after dispatch. [S2]",
+      "citation_ids": [
+        "S1",
+        "S2"
+      ]
+    },
+    {
+      "case_id": "refund-condition",
+      "expected_answerable": true,
+      "predicted_answerable": true,
+      "answer_behavior_correct": true,
+      "retrieval_hit_at_k": true,
+      "reciprocal_rank_at_k": 1.0,
+      "retrieval_precision_at_k": 0.2,
+      "retrieval_recall_at_k": 1.0,
+      "valid_citation_coverage": true,
+      "citation_ids_valid": true,
+      "cited_source_precision": 1.0,
+      "expected_term_coverage": 1.0,
+      "matched_expected_terms": [
+        "unused",
+        "receipt"
+      ],
+      "retrieved": [
+        {
+          "source": "refund_policy.txt",
+          "page": null,
+          "score": 0.3905,
+          "citation_id": "S1"
+        }
+      ],
+      "answer": "The item must be unused and returned with its receipt. [S1]",
+      "citation_ids": [
+        "S1"
+      ]
+    },
+    {
+      "case_id": "subscription-exclusion",
+      "expected_answerable": true,
+      "predicted_answerable": true,
+      "answer_behavior_correct": true,
+      "retrieval_hit_at_k": true,
+      "reciprocal_rank_at_k": 1.0,
+      "retrieval_precision_at_k": 0.2,
+      "retrieval_recall_at_k": 1.0,
+      "valid_citation_coverage": true,
+      "citation_ids_valid": true,
+      "cited_source_precision": 0.5,
+      "expected_term_coverage": 1.0,
+      "matched_expected_terms": [
+        "not refundable"
+      ],
+      "retrieved": [
+        {
+          "source": "refund_policy.txt",
+          "page": null,
+          "score": 0.586,
+          "citation_id": "S1"
+        },
+        {
+          "source": "account_security.txt",
+          "page": null,
+          "score": 0.3728,
+          "citation_id": "S2"
+        }
+      ],
+      "answer": "Activated digital subscriptions are not refundable. [S1] Northstar Demo Store account security\n\nCustomers can enable two-step verification from Account Settings under Security. [S2]",
+      "citation_ids": [
+        "S1",
+        "S2"
+      ]
+    },
+    {
+      "case_id": "enable-two-step",
+      "expected_answerable": true,
+      "predicted_answerable": true,
+      "answer_behavior_correct": true,
+      "retrieval_hit_at_k": true,
+      "reciprocal_rank_at_k": 1.0,
+      "retrieval_precision_at_k": 0.2,
+      "retrieval_recall_at_k": 1.0,
+      "valid_citation_coverage": true,
+      "citation_ids_valid": true,
+      "cited_source_precision": 1.0,
+      "expected_term_coverage": 1.0,
+      "matched_expected_terms": [
+        "Account Settings",
+        "Security"
+      ],
+      "retrieved": [
+        {
+          "source": "account_security.txt",
+          "page": null,
+          "score": 0.4854,
+          "citation_id": "S1"
+        }
+      ],
+      "answer": "Northstar Demo Store account security\n\nCustomers can enable two-step verification from Account Settings under Security. [S1]",
+      "citation_ids": [
+        "S1"
+      ]
+    },
+    {
+      "case_id": "delivery-time",
+      "expected_answerable": true,
+      "predicted_answerable": true,
+      "answer_behavior_correct": true,
+      "retrieval_hit_at_k": true,
+      "reciprocal_rank_at_k": 1.0,
+      "retrieval_precision_at_k": 0.2,
+      "retrieval_recall_at_k": 1.0,
+      "valid_citation_coverage": true,
+      "citation_ids_valid": true,
+      "cited_source_precision": 1.0,
+      "expected_term_coverage": 1.0,
+      "matched_expected_terms": [
+        "3 to 5 business days"
+      ],
+      "retrieved": [
+        {
+          "source": "shipping_policy.txt",
+          "page": null,
+          "score": 0.63,
+          "citation_id": "S1"
+        }
+      ],
+      "answer": "Northstar Demo Store shipping policy\n\nStandard shipping usually takes 3 to 5 business days after dispatch. [S1]",
+      "citation_ids": [
+        "S1"
+      ]
+    },
+    {
+      "case_id": "password-safety",
+      "expected_answerable": true,
+      "predicted_answerable": true,
+      "answer_behavior_correct": true,
+      "retrieval_hit_at_k": true,
+      "reciprocal_rank_at_k": 1.0,
+      "retrieval_precision_at_k": 0.2,
+      "retrieval_recall_at_k": 1.0,
+      "valid_citation_coverage": true,
+      "citation_ids_valid": true,
+      "cited_source_precision": 1.0,
+      "expected_term_coverage": 1.0,
+      "matched_expected_terms": [
+        "never asks",
+        "password"
+      ],
+      "retrieved": [
+        {
+          "source": "account_security.txt",
+          "page": null,
+          "score": 0.5095,
+          "citation_id": "S1"
+        }
+      ],
+      "answer": "Support never asks customers to send their password. [S1]",
+      "citation_ids": [
+        "S1"
+      ]
+    },
+    {
+      "case_id": "unknown-market-cap",
+      "expected_answerable": false,
+      "predicted_answerable": true,
+      "answer_behavior_correct": false,
+      "retrieval_hit_at_k": null,
+      "reciprocal_rank_at_k": null,
+      "retrieval_precision_at_k": null,
+      "retrieval_recall_at_k": null,
+      "valid_citation_coverage": null,
+      "citation_ids_valid": true,
+      "cited_source_precision": 0.0,
+      "expected_term_coverage": null,
+      "matched_expected_terms": [],
+      "retrieved": [
+        {
+          "source": "shipping_policy.txt",
+          "page": null,
+          "score": 0.3834,
+          "citation_id": "S1"
+        },
+        {
+          "source": "refund_policy.txt",
+          "page": null,
+          "score": 0.3278,
+          "citation_id": "S2"
+        }
+      ],
+      "answer": "Northstar Demo Store shipping policy\n\nStandard shipping usually takes 3 to 5 business days after dispatch. [S1] Northstar Demo Store refund policy\n\nCustomers may request a refund within 30 calendar days after delivery. [S2]",
+      "citation_ids": [
+        "S1",
+        "S2"
+      ]
+    }
+  ]
+}

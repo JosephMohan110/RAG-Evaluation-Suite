@@ -1,0 +1,1113 @@
+//@version=6
+// ═════════════════════════════════════════════════════════════════════════════════
+//  INSTITUTIONAL ORDER FLOW & LIQUIDITY RADAR  —  COMBINED (footprint + approximate)
+//
+//  Purpose : selective, confirmed BUY signals built from selling absorption, trapped
+//            sellers (sweep + reclaim), footprint delta / imbalances, volume-profile
+//            support (HVN / POC / VAL), impulse zones and an ESTIMATED liquidity map.
+//
+//  DATA HONESTY
+//   • ONE script, two order-flow sources (setting 05 · Order-flow source):
+//       - Approximate (lower TF): estimated buy/sell volume from lower-timeframe candles (default).
+//       - Real footprint: request.footprint(); needs a plan/symbol that supports it.
+//     Approximate data is labelled as such and is NOT equivalent to real footprint data.
+//   • The volume profile (POC / VAH / VAL / HVN) is an APPROXIMATE rolling profile built
+//     from candle volume spread over price bins. It is NOT TradingView's built-in
+//     Visible Range Volume Profile.
+//   • The "Estimated Liquidity Heatmap" / Synthetic DOM is inferred from swing structure,
+//     touches, volume and absorption. It is NOT order-book (Level 2) data.
+//
+//  SIGNAL INTEGRITY
+//   • All state changes and all BUY labels/alerts run only on confirmed bars
+//     (barstate.isconfirmed). Confirmed BUY labels never move or disappear.
+//   • Pivots are confirmed pivots: a swing is only known "Pivot right bars" bars later.
+//   • The only higher-timeframe request uses the PREVIOUS closed HTF bar, lookahead off.
+//   • Rule-based confluence score ≠ probability of winning. Plotted prices are analytic
+//     reference levels, not guaranteed execution prices. Nothing here is advice.
+//
+//  VOLUME ADDITIONS (this version)
+//   • Volume columns drawn at the bottom of the price pane (buy/sell split + spike highlight).
+//   • Dashboard rows: Volume, Relative volume, Buy / Sell volume.
+// ═════════════════════════════════════════════════════════════════════════════════
+indicator("Institutional Order Flow & Liquidity Radar", shorttitle="IOFLR", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500, max_bars_back=1000)
+
+// ═════════════════════════════════════════ INPUTS ═════════════════════════════════
+const string G_DATA = "01 · Data & Footprint"
+const string G_ABS  = "02 · Absorption"
+const string G_TRAP = "03 · Trapped Traders"
+const string G_VP   = "04 · HVN Volume Profile (approximate)"
+const string G_IMB  = "05 · Imbalance & Delta"
+const string G_IMP  = "06 · Impulse Zones"
+const string G_HEAT = "07 · Estimated Liquidity Heatmap (Synthetic DOM)"
+const string G_BUY  = "08 · BUY Signal Filters"
+const string G_RISK = "09 · Entry & Risk Levels"
+const string G_DASH = "10 · Dashboard"
+const string G_ALRT = "11 · Alerts"
+const string G_VIS  = "12 · Visual Appearance"
+
+// 01 Data
+atrLen = input.int(14, "ATR length", minval=1, group=G_DATA, tooltip="ATR scales every distance threshold so the script adapts to any symbol / tick size.")
+volLen = input.int(20, "Average-volume length", minval=2, group=G_DATA, tooltip="Window for relative volume (volume ÷ average volume). Shorter = more reactive.")
+
+// 02 Absorption
+absRelVol   = input.float(1.5, "Min relative volume", minval=0.5, step=0.1, group=G_ABS, tooltip="Volume must be at least this multiple of average. Higher = fewer, heavier absorption events.")
+absWick     = input.float(0.40, "Min rejection-wick / range", minval=0.1, maxval=0.9, step=0.05, group=G_ABS, tooltip="Lower wick as share of candle range (bullish). Higher = stricter.")
+absClose    = input.float(0.60, "Min close position in range", minval=0.3, maxval=0.95, step=0.05, group=G_ABS, tooltip="Bullish: close must be at least this far up the candle range.")
+absShare    = input.float(55.0, "Min aggressor share (%)", minval=50.0, maxval=90.0, step=1.0, group=G_ABS, tooltip="Sell volume share (bullish absorption) / buy volume share (bearish) required when order-flow data exists.")
+absProg     = input.float(0.35, "Max price progress per volume", minval=0.05, maxval=2.0, step=0.05, group=G_ABS, tooltip="Net body move in the aggressor's direction ÷ (ATR × relative volume). Lower = price must refuse to move more.")
+absMinConfC = input.int(4, "Min independent confirmations (of 6)", minval=2, maxval=6, group=G_ABS, tooltip="Number of independent evidence items required. A wick alone is never enough.")
+absMinScoreC = input.int(60, "Min absorption score (0-100)", minval=1, maxval=100, group=G_ABS, tooltip="Score below this is ignored.")
+absStrong   = input.int(75, "'Strong' absorption score", minval=1, maxval=100, group=G_ABS, tooltip="Strong events get a chart marker and can trigger the optional preliminary alert.")
+showAbs     = input.bool(true, "Show absorption markers", group=G_ABS)
+
+// 03 Trapped traders
+pivL         = input.int(5, "Pivot left bars", minval=1, group=G_TRAP, tooltip="Bars to the left of a swing.")
+pivR         = input.int(3, "Pivot right bars (confirmation delay)", minval=1, group=G_TRAP, tooltip="A swing is confirmed only this many bars AFTER it forms. Larger = fewer false pivots, later detection.")
+reclaimBars  = input.int(3, "Max bars to reclaim after sweep", minval=1, group=G_TRAP, tooltip="If price has not closed back above the swept low within this many bars, it is treated as a genuine breakdown.")
+sweepMinATR  = input.float(0.05, "Min sweep depth (ATR)", minval=0.0, step=0.01, group=G_TRAP, tooltip="Price must pierce the level by at least this much to count as a sweep.")
+maxSweepATR  = input.float(3.0, "Max sweep depth (ATR)", minval=0.2, step=0.1, group=G_TRAP, tooltip="Deeper pushes are treated as a breakdown, not a sweep.")
+showTrap     = input.bool(true, "Show SELLERS / BUYERS TRAPPED labels", group=G_TRAP)
+
+// 04 Volume profile
+vpOn        = input.bool(true, "Enable approximate volume profile", group=G_VP)
+vpLookback  = input.int(150, "Profile lookback bars", minval=20, maxval=800, group=G_VP, tooltip="Rolling window. Larger = broader, slower-moving levels.")
+vpBins      = input.int(40, "Target number of price bins", minval=10, maxval=200, group=G_VP, tooltip="Bin size = range / bins (never below the tick multiplier below).")
+vpTickMult  = input.int(1, "Minimum bin size (ticks)", minval=1, group=G_VP, tooltip="Lower bound for bin height in ticks – keeps bins sensible on any instrument.")
+vpMethod    = input.string("Close-weighted", "Volume distribution", options=["Uniform", "Close-weighted", "HLC3-weighted"], group=G_VP, tooltip="Uniform: volume spread evenly over the candle's range. Close-weighted / HLC3-weighted: 50% of volume placed at that price, 50% spread evenly.")
+vpVA        = input.int(70, "Value area %", minval=50, maxval=95, group=G_VP)
+hvnN        = input.int(3, "HVNs to keep", minval=1, maxval=8, group=G_VP)
+hvnMinRel   = input.float(1.5, "Min HVN volume vs average bin", minval=1.0, step=0.1, group=G_VP, tooltip="A bin must hold at least this multiple of the average bin volume AND be a local maximum (±2 bins).")
+vpSession   = input.bool(false, "Reset profile each session", group=G_VP, tooltip="When on, the profile restarts at each new period below (capped by the lookback).")
+vpSessTF    = input.string("D", "Session period", group=G_VP, tooltip="Timeframe string, e.g. D, W, 240. Must not be lower than the chart timeframe.")
+vpEvery     = input.int(2, "Recompute every N bars", minval=1, maxval=20, group=G_VP, tooltip="Performance setting. 1 = most accurate, slower on long histories.")
+showProfile = input.bool(true, "Draw POC / VAH / VAL / HVN", group=G_VP)
+lvlTolATR   = input.float(0.30, "Level interaction tolerance (ATR)", minval=0.0, step=0.05, group=G_VP, tooltip="How close price must come to a level for it to count as an interaction.")
+
+// 05 Imbalance & delta  (footprint-specific inputs live in the data block further down)
+minDeltaPct = input.float(10.0, "Min delta strength (% of volume)", minval=1.0, maxval=80.0, step=1.0, group=G_IMB, tooltip="|Buy − Sell| ÷ total volume needed for delta to count as meaningful.")
+minRun      = input.int(2, "Min consecutive imbalance rows", minval=1, maxval=8, group=G_IMB, tooltip="Stacked imbalances. 1 = any single imbalance row.")
+rowVolPct   = input.float(1.0, "Min row volume (% of bar volume)", minval=0.0, maxval=20.0, step=0.5, group=G_IMB, tooltip="Rows with less volume than this are ignored as insignificant.")
+
+// 06 Impulse zones
+impOn       = input.bool(true, "Enable impulse zones", group=G_IMP)
+impAtr      = input.float(1.5, "Min candle range (ATR)", minval=0.5, step=0.1, group=G_IMP, tooltip="Displacement candle must be at least this many ATRs.")
+impRv       = input.float(1.5, "Min relative volume", minval=0.5, step=0.1, group=G_IMP)
+impBody     = input.float(0.60, "Min body / range", minval=0.3, maxval=0.95, step=0.05, group=G_IMP)
+impOverlap  = input.float(0.50, "Max overlap with previous candle", minval=0.0, maxval=1.0, step=0.05, group=G_IMP, tooltip="Share of this candle's range overlapped by the previous candle. Lower = more gap-like displacement.")
+impMinEv    = input.int(3, "Min supporting evidence (of 5)", minval=1, maxval=5, group=G_IMP, tooltip="Evidence: relative volume, positive delta, stacked imbalances, structure break, limited overlap.")
+impMax      = input.int(6, "Max active zones", minval=1, maxval=30, group=G_IMP)
+impExtend   = input.int(100, "Extend zone right (bars)", minval=10, maxval=500, group=G_IMP)
+impDelAfter = input.int(20, "Delete invalidated zone after (bars)", minval=1, maxval=200, group=G_IMP)
+
+// 07 Estimated liquidity heatmap
+showHeat     = input.bool(true, "Show Estimated Liquidity Heatmap", group=G_HEAT, tooltip="Colours: BLUE = estimated sell-side liquidity (stops below lows), ORANGE = estimated buy-side liquidity (stops above highs), PURPLE = zone with absorption. Stronger colour = more independent factors. Swept zones fade.")
+heatBinATR   = input.float(0.25, "Zone height (ATR)", minval=0.05, step=0.05, group=G_HEAT, tooltip="Price-bin size of a liquidity zone and merge distance for equal highs/lows.")
+heatMinTouch = input.int(2, "Min touches", minval=1, maxval=10, group=G_HEAT, tooltip="Pivot + later rejections. 2 = equal highs/lows or a retest.")
+heatMinVol   = input.float(1.0, "Min avg relative volume at touches", minval=0.0, step=0.1, group=G_HEAT)
+heatMinScore = input.int(45, "Min estimated-liquidity score", minval=1, maxval=100, group=G_HEAT)
+heatMax      = input.int(8, "Max zones displayed", minval=1, maxval=30, group=G_HEAT)
+heatExpiry   = input.int(400, "Expire after N bars without interaction", minval=20, maxval=2000, group=G_HEAT)
+
+// 08 BUY filters
+sens = input.string("Balanced", "Signal sensitivity", options=["Strict", "Balanced", "Aggressive", "Custom"], group=G_BUY, tooltip="Strict ≈ fewest signals (score 70, 4 absorption confirmations, 3 evidence groups). Balanced (default) ≈ score 60 / 3 / 2. Aggressive ≈ score 50 / 3 / 2 with looser absorption. Custom uses the individual values in the Absorption group and below. If you see no BUY labels, move to Balanced or Aggressive.")
+wAbs       = input.int(20, "Weight · bullish absorption", minval=0, maxval=100, group=G_BUY)
+wSweep     = input.int(20, "Weight · trapped sellers / sweep-reclaim", minval=0, maxval=100, group=G_BUY)
+wFp        = input.int(20, "Weight · delta & imbalance", minval=0, maxval=100, group=G_BUY, tooltip="Dropped from the denominator (score re-normalised) when order-flow data is unavailable.")
+wLvl       = input.int(15, "Weight · HVN / VAL / liquidity zone", minval=0, maxval=100, group=G_BUY)
+wStruct    = input.int(15, "Weight · structure confirmation", minval=0, maxval=100, group=G_BUY)
+wVol       = input.int(10, "Weight · volume / impulse", minval=0, maxval=100, group=G_BUY)
+buyThrC    = input.int(70, "Minimum BUY score", minval=1, maxval=100, group=G_BUY, tooltip="Higher = fewer, more selective signals. This is a rule-based confluence score, not a win probability.")
+minEvidC   = input.int(3, "Min independent evidence groups", minval=1, maxval=6, group=G_BUY, tooltip="How many score components must individually reach the level below.")
+evMin      = input.float(0.40, "Evidence level per component", minval=0.1, maxval=1.0, step=0.05, group=G_BUY)
+setupWin   = input.int(8, "Setup window (bars)", minval=2, maxval=40, group=G_BUY, tooltip="After an absorption / sweep-reclaim trigger, the BUY must confirm within this many bars or the setup expires.")
+cooldown   = input.int(10, "Min bars between BUY signals", minval=0, maxval=200, group=G_BUY)
+requireSweep = input.bool(false, "Require trapped-sellers sweep (strict)", group=G_BUY)
+requireBull  = input.bool(true, "Require bullish confirmation candle", group=G_BUY)
+noBearImb    = input.bool(true, "Block BUY on selling-imbalance with downside progress", group=G_BUY)
+htfOn      = input.bool(false, "Higher-timeframe bias filter", group=G_BUY, tooltip="Requires close above the previous closed HTF bar's EMA. Uses confirmed data only (lookahead off).")
+htfTF      = input.string("240", "HTF timeframe", group=G_BUY)
+htfLen     = input.int(50, "HTF EMA length", minval=2, group=G_BUY)
+maxRiskATR = input.float(6.0, "Max stop distance (ATR)", minval=0.5, step=0.5, group=G_BUY, tooltip="BUY is skipped if the structural stop would be wider than this.")
+
+// 09 Risk
+showRisk   = input.bool(true, "Show entry / stop / targets", group=G_RISK)
+slBuf      = input.float(0.25, "Stop buffer (ATR)", minval=0.0, step=0.05, group=G_RISK, tooltip="Added below the swept low / absorption low.")
+rr1        = input.float(1.5, "Target 1 (R)", minval=0.5, step=0.25, group=G_RISK)
+rr2        = input.float(2.0, "Target 2 (R)", minval=0.5, step=0.25, group=G_RISK)
+lineBars   = input.int(40, "Level line length (bars)", minval=5, maxval=300, group=G_RISK)
+labelMode  = input.string("Full (entry / SL / TP)", "BUY label detail", options=["Full (entry / SL / TP)", "Compact"], group=G_RISK, tooltip="Full prints Entry, Stop-loss, TP1 and TP2 prices directly inside the BUY label. Compact shows only BUY + score (prices stay in the tooltip, lines and dashboard).")
+showRRBox  = input.bool(true, "Draw shaded reward / risk boxes", group=G_RISK, tooltip="Green box = entry → TP2, red box = entry → stop-loss.")
+showHits   = input.bool(true, "Mark TP / SL hits on chart", group=G_RISK, tooltip="Marks the bar where the latest BUY reached TP1 / TP2 or its stop. Intrabar order is unknown, so the stop is checked first on a bar that touches both.")
+maxSig     = input.int(30, "Signals with level lines kept", minval=1, maxval=100, group=G_RISK, tooltip="Older level lines are removed to respect TradingView's drawing limits. BUY labels are kept.")
+showReasons = input.bool(true, "Show reasons in BUY label", group=G_RISK)
+
+// 10 Dashboard
+showDash    = input.bool(true, "Show dashboard", group=G_DASH)
+dashPosStr  = input.string("Top Right", "Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group=G_DASH)
+dashSizeStr = input.string("Small", "Text size", options=["Tiny", "Small", "Normal"], group=G_DASH)
+
+// 11 Alerts
+alertDyn    = input.bool(true, "Dynamic alert() on confirmed BUY (symbol, entry, SL, targets, score)", group=G_ALRT, tooltip="Create the TradingView alert with condition 'Any alert() function call'. Do not also enable the alertcondition BUY alert for the same chart, or you will get two notifications.")
+alertPreDyn = input.bool(false, "Dynamic alert() on strong absorption / trapped sellers (preliminary)", group=G_ALRT, tooltip="Preliminary context only – NOT a BUY.")
+
+// 12 Visuals
+bullC    = input.color(#00C853, "Bullish / BUY", group=G_VIS)
+bearC    = input.color(#FF1744, "Bearish", group=G_VIS)
+sellLiqC = input.color(#2962FF, "Estimated sell-side liquidity", group=G_VIS)
+buyLiqC  = input.color(#FF9100, "Estimated buy-side liquidity", group=G_VIS)
+absorbC  = input.color(#AA00FF, "Absorption", group=G_VIS)
+pocC     = input.color(#FFD600, "POC", group=G_VIS)
+vaC      = input.color(#90A4AE, "VAH / VAL", group=G_VIS)
+hvnC     = input.color(#26C6DA, "HVN", group=G_VIS)
+showVol    = input.bool(true, "Show volume bars on chart", group=G_VIS, tooltip="Volume columns drawn at the bottom of the price pane. Green/red split = estimated buy/sell volume when order-flow data exists, otherwise candle direction.")
+volHeight  = input.float(15.0, "Volume bar max height (% of price range)", minval=3.0, maxval=40.0, step=1.0, group=G_VIS)
+volScaleLb = input.int(150, "Volume scaling lookback (bars)", minval=20, maxval=500, group=G_VIS)
+volHiRv    = input.float(2.0, "Highlight volume spikes above (× average)", minval=1.0, step=0.1, group=G_VIS)
+
+
+// Effective thresholds (preset or custom)
+int buyThr      = sens == "Strict" ? 70 : sens == "Balanced" ? 60 : sens == "Aggressive" ? 50 : buyThrC
+int absMinConf  = sens == "Strict" ? 4 : sens == "Custom" ? absMinConfC : 3
+int absMinScore = sens == "Strict" ? 60 : sens == "Balanced" ? 50 : sens == "Aggressive" ? 45 : absMinScoreC
+int minEvid     = sens == "Strict" ? 3 : sens == "Custom" ? minEvidC : 2
+
+// ═════════════════════════════════════════ TYPES ══════════════════════════════════
+type LiqZone
+    float lvl
+    float w
+    int   dir
+    int   born
+    int   made
+    int   lastHit
+    int   touches = 1
+    float volSum = 0.0
+    int   absCnt = 0
+    bool  swept = false
+    bool  active = true
+    bool  fin = false
+    bool  wasQual = false
+    bool  qual = false
+    bool  eq = false
+    int   deadBar = na
+    float score = 0.0
+    box   bx = na
+
+type ImpZone
+    float top
+    float bot
+    int   dir
+    int   born
+    int   state = 0
+    int   deadBar = na
+    box   bx = na
+
+// ═════════════════════════════════════════ STATE ══════════════════════════════════
+var array<LiqZone> zones = array.new<LiqZone>()
+var array<ImpZone> imps = array.new<ImpZone>()
+var array<float> hvnPrices = array.new<float>()
+var array<float> hvnRel = array.new<float>()
+var array<label> buyLabels = array.new<label>()
+var array<label> infoLabels = array.new<label>()
+var array<label> lvlLabels = array.new<label>()
+var array<line> sigLines = array.new<line>()
+var array<box> sigBoxes = array.new<box>()
+var array<box> hvnBoxes = array.new<box>()
+
+var float pocP = na
+var float vahP = na
+var float valP = na
+var float vpBin = na
+var int   vpLbUsed = 0
+var int   sessStartBar = 0
+var line  pocLn = na
+var line  vahLn = na
+var line  valLn = na
+
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var int   structDir = 0
+var int   bosUpBar = na
+var int   bosDnBar = na
+var int   lastBullAbsBar = na
+var int   lastBearAbsBar = na
+var int   lastTrapSBar = na
+var int   lastTrapBBar = na
+
+var float pendSLvl = na
+var float pendSLow = na
+var int   pendSBar = na
+var LiqZone pendSZ = na
+var float pendBLvl = na
+var float pendBHigh = na
+var int   pendBBar = na
+var LiqZone pendBZ = na
+
+var bool  armed = false
+var int   armStart = na
+var int   armBar = na
+var float armHigh = na
+var float armLow = na
+var float armLvl = na
+var float armAbsF = 0.0
+var float armSweepF = 0.0
+var float armFpF = 0.0
+var float armLvlF = 0.0
+var float armRv = 0.0
+var bool  armImp = false
+var float liveScore = na
+var float lastScore = na
+var int   lastBuyBar = na
+
+var float sigEntry = na
+var float sigSL = na
+var float sigT1 = na
+var float sigT2 = na
+var int   sigBar = na
+var int   sigStatus = 0
+
+var table dash = na
+
+// ═════════════════════════════════════ BASE SERIES ════════════════════════════════
+float atrV   = ta.atr(atrLen)
+float avgVol = ta.sma(volume, volLen)
+float rv     = avgVol > 0 ? volume / avgVol : na
+float rng    = high - low
+float rngS   = rng > syminfo.mintick * 0.5 ? rng : na
+float closePos = na(rngS) ? 0.5 : (close - low) / rngS
+float lwR    = na(rngS) ? 0.0 : (math.min(open, close) - low) / rngS
+float uwR    = na(rngS) ? 0.0 : (high - math.max(open, close)) / rngS
+float bodyAbs = math.abs(close - open)
+
+// ───────────────────── ORDER-FLOW DATA (one script, two sources) ─────────────────────
+// "Approximate (lower TF)": buy/sell volume ESTIMATED from lower-timeframe candles. Works on any plan.
+// "Real footprint"        : request.footprint(). Needs a TradingView plan/symbol that supports it.
+// The footprint request is only made when "Real footprint" is selected.
+ofSource = input.string("Approximate (lower TF)", "Order-flow source", options=["Approximate (lower TF)", "Real footprint"], group=G_IMB, tooltip="Start with Approximate. Switch to Real footprint only if your TradingView plan supports request.footprint(). Approximate data is NOT equivalent to real footprint data.")
+fpTicks  = input.int(50, "Footprint ticks per row (real footprint)", minval=1, group=G_IMB, tooltip="Raise it if TradingView reports too many rows for the symbol/timeframe.")
+fpVA     = input.int(70, "Footprint value area % (real footprint)", minval=1, maxval=100, group=G_IMB)
+fpImbPct = input.int(300, "Footprint imbalance % (real footprint)", minval=100, group=G_IMB)
+ltfInput = input.string("", "Lower timeframe (approximate mode)", group=G_IMB, tooltip="Blank = auto (1D+ → 60m, 1h+ → 5m, 5m+ → 1m, else chart timeframe = candle-level estimate). Must be <= chart timeframe.")
+ltfRatio = input.float(2.5, "Approx. imbalance ratio (approximate mode)", minval=1.1, step=0.1, group=G_IMB, tooltip="A lower-TF bar is 'imbalanced' when estimated buy/sell volume ratio (or reverse) exceeds this.")
+
+bool useFP = ofSource == "Real footprint"
+footprint fp = useFP ? request.footprint(fpTicks, fpVA, fpImbPct) : na
+
+string autoLtf = timeframe.in_seconds() >= 86400 ? "60" : timeframe.in_seconds() >= 3600 ? "5" : timeframe.in_seconds() >= 300 ? "1" : timeframe.period
+string ltfTF = ltfInput == "" ? autoLtf : ltfInput
+[ltO, ltH, ltL, ltC, ltV] = request.security_lower_tf(syminfo.tickerid, ltfTF, [open, high, low, close, volume])
+
+float buyVol = na
+float sellVol = na
+float fpPoc = na
+float fpVah = na
+float fpVal = na
+int buyImbCnt = 0
+int sellImbCnt = 0
+int buyRun = 0
+int sellRun = 0
+string dataLabel = useFP ? "Footprint (real data)" : "Approximate (LTF " + ltfTF + ")"
+string fpTag = useFP ? "Δ/IMB" : "~Δ/IMB"
+
+if useFP and not na(fp)
+    buyVol := fp.buy_volume()
+    sellVol := fp.sell_volume()
+    volume_row pocRow = fp.poc()
+    fpPoc := (pocRow.up_price() + pocRow.down_price()) / 2.0
+    fpVah := fp.vah().up_price()
+    fpVal := fp.val().down_price()
+    float totalV = nz(buyVol) + nz(sellVol)
+    float minRowV = totalV * rowVolPct / 100.0
+    int bRun = 0
+    int sRun = 0
+    array<volume_row> fpRows = fp.rows()
+    for r in fpRows
+        bool sigRow = r.total_volume() >= minRowV
+        if sigRow and r.has_buy_imbalance()
+            buyImbCnt += 1
+            bRun += 1
+            buyRun := math.max(buyRun, bRun)
+        else
+            bRun := 0
+        if sigRow and r.has_sell_imbalance()
+            sellImbCnt += 1
+            sRun += 1
+            sellRun := math.max(sellRun, sRun)
+        else
+            sRun := 0
+else if not useFP and ltV.size() > 0
+    float bSum = 0.0
+    float sSum = 0.0
+    int bRun2 = 0
+    int sRun2 = 0
+    for i = 0 to ltV.size() - 1
+        float hi_ = ltH.get(i)
+        float lo_ = ltL.get(i)
+        float cl_ = ltC.get(i)
+        float v_ = nz(ltV.get(i))
+        float rg_ = hi_ - lo_
+        float bp_ = (not na(rg_) and rg_ > 0) ? (cl_ - lo_) / rg_ : 0.5
+        float bv_ = v_ * bp_
+        float sv_ = v_ - bv_
+        bSum += bv_
+        sSum += sv_
+        if v_ > 0 and bv_ >= sv_ * ltfRatio
+            buyImbCnt += 1
+            bRun2 += 1
+            buyRun := math.max(buyRun, bRun2)
+        else
+            bRun2 := 0
+        if v_ > 0 and sv_ >= bv_ * ltfRatio
+            sellImbCnt += 1
+            sRun2 += 1
+            sellRun := math.max(sellRun, sRun2)
+        else
+            sRun2 := 0
+    if bSum + sSum > 0
+        buyVol := bSum
+        sellVol := sSum
+// <<FP_BLOCK_END>>
+
+bool  hasOF  = not na(buyVol) and not na(sellVol) and (buyVol + sellVol) > 0
+float totOF  = hasOF ? buyVol + sellVol : na
+float deltaPct = hasOF ? (buyVol - sellVol) / totOF * 100.0 : na
+float sellShare = hasOF ? sellVol / totOF : na
+float buyShare  = hasOF ? buyVol / totOF : na
+
+// Higher-timeframe bias (previous CLOSED HTF bar only – no lookahead)
+float htfEma = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfLen)[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+bool htfOK = not htfOn or na(htfEma) or timeframe.in_seconds(htfTF) < timeframe.in_seconds() or close > htfEma
+
+// Pivots (confirmed with pivR bars delay)
+float phv = ta.pivothigh(high, pivL, pivR)
+float plv = ta.pivotlow(low, pivL, pivR)
+bool newSess = timeframe.change(vpSessTF)
+
+// ═════════════════════════════════════════ FUNCTIONS ══════════════════════════════
+binOf(float p, float lo, float bsz, int nb) =>
+    math.max(0, math.min(nb - 1, int(math.floor((p - lo) / bsz))))
+
+// Does the current bar interact with level L and close on the "rejecting" side?
+touchOK(bool bull, float L, float hw, float tol) =>
+    bool r = false
+    if not na(L)
+        if bull
+            r := low <= L + hw + tol and high >= L - hw - tol and close >= L
+        else
+            r := high >= L - hw - tol and low <= L + hw + tol and close <= L
+    r
+
+// Best key-level confluence for the current bar (0..1) and its name.
+// Level counts only if price REJECTED it (closed on the supporting / resisting side); a close
+// through the level (acceptance / break) earns nothing.
+levelFrac(bool bull) =>
+    float best = 0.0
+    string nm = "-"
+    float tol = nz(atrV, 0.0) * lvlTolATR
+    float hw = nz(vpBin, 0.0) * 0.5
+    if vpOn
+        if touchOK(bull, pocP, hw, tol) and 0.85 > best
+            best := 0.85
+            nm := "POC"
+        float vE = bull ? valP : vahP
+        if touchOK(bull, vE, hw, tol) and 0.9 > best
+            best := 0.9
+            nm := bull ? "VAL" : "VAH"
+        for h in hvnPrices
+            if touchOK(bull, h, hw, tol) and 1.0 > best
+                best := 1.0
+                nm := "HVN"
+    for z in zones
+        if z.active and z.qual and not z.swept and z.dir == (bull ? 1 : -1)
+            float zf = z.score / 100.0
+            if touchOK(bull, z.lvl, z.w * 0.5, tol) and zf > best
+                best := zf
+                nm := "LIQ"
+    float sw = bull ? lastSwingLow : lastSwingHigh
+    if touchOK(bull, sw, 0.0, tol) and 0.6 > best
+        best := 0.6
+        nm := "SWING"
+    [best, nm]
+
+impRevisitBull() =>
+    bool r = false
+    for z in imps
+        if z.dir == 1 and z.state < 2 and bar_index > z.born and low <= z.top and close > z.bot
+            r := true
+    r
+
+addPivotZone(array<LiqZone> arr, float p, int d, int bi, float rvv, float w) =>
+    bool merged = false
+    for z in arr
+        if not merged and z.active and z.dir == d and not z.swept and math.abs(p - z.lvl) <= w
+            z.touches := z.touches + 1
+            z.volSum := z.volSum + rvv
+            z.lastHit := bar_index
+            z.lvl := d == 1 ? math.min(z.lvl, p) : math.max(z.lvl, p)
+            merged := true
+    if not merged
+        arr.push(LiqZone.new(lvl = p, w = w, dir = d, born = bi, made = bar_index, lastHit = bar_index, volSum = rvv))
+    merged
+
+statusTxt(int s) =>
+    switch s
+        1 => "Open"
+        2 => "T1 reached"
+        3 => "T2 reached"
+        4 => "Stop hit"
+        5 => "T1 then stop"
+        => "—"
+
+// ═════════════════════════════ BAR-LEVEL ORDER-FLOW READINGS ══════════════════════
+[lvlBullF, lvlBullNm] = levelFrac(true)
+[lvlBearF, lvlBearNm] = levelFrac(false)
+
+// ── Module A: absorption ─────────────────────────────────────────────────────────
+float rvN = nz(rv, 1.0)
+float aDen = hasOF ? 100.0 : 80.0
+
+bool aeVol   = not na(rv) and rv >= absRelVol
+bool aeWick  = lwR >= absWick
+bool aeClose = closePos >= absClose
+bool aeDelta = hasOF and sellShare >= absShare / 100.0
+bool aeProg  = not na(atrV) and atrV > 0 and math.max(open - close, 0.0) / (atrV * math.max(rvN, 1.0)) <= absProg
+bool aeLvl   = lvlBullF > 0
+
+float fVol   = aeVol ? math.min(1.0, 0.6 + 0.8 * (rv / absRelVol - 1.0)) : 0.0
+float fWick  = aeWick ? math.min(1.0, 0.6 + 0.4 * (lwR - absWick) / math.max(0.75 - absWick, 0.1)) : 0.0
+float fDelta = aeDelta ? math.min(1.0, 0.6 + 0.4 * (sellShare - absShare / 100.0) / 0.2) : 0.0
+float bullAbsScore = 100.0 * (20.0 * fVol + 20.0 * fWick + (aeClose ? 15.0 : 0.0) + 20.0 * fDelta + (aeProg ? 15.0 : 0.0) + 10.0 * lvlBullF) / aDen
+int   bullConf = (aeVol ? 1 : 0) + (aeWick ? 1 : 0) + (aeClose ? 1 : 0) + (aeDelta ? 1 : 0) + (aeProg ? 1 : 0) + (aeLvl ? 1 : 0)
+bool  bullAbs = bullConf >= absMinConf and bullAbsScore >= absMinScore and (aeVol or aeDelta) and aeClose
+bool  bullAbsStrong = bullAbs and bullAbsScore >= absStrong
+float bullAbsF = bullAbs ? bullAbsScore / 100.0 : 0.0
+
+bool beVol   = aeVol
+bool beWick  = uwR >= absWick
+bool beClose = closePos <= 1.0 - absClose
+bool beDelta = hasOF and buyShare >= absShare / 100.0
+bool beProg  = not na(atrV) and atrV > 0 and math.max(close - open, 0.0) / (atrV * math.max(rvN, 1.0)) <= absProg
+bool beLvl   = lvlBearF > 0
+float gVol   = beVol ? math.min(1.0, 0.6 + 0.8 * (rv / absRelVol - 1.0)) : 0.0
+float gWick  = beWick ? math.min(1.0, 0.6 + 0.4 * (uwR - absWick) / math.max(0.75 - absWick, 0.1)) : 0.0
+float gDelta = beDelta ? math.min(1.0, 0.6 + 0.4 * (buyShare - absShare / 100.0) / 0.2) : 0.0
+float bearAbsScore = 100.0 * (20.0 * gVol + 20.0 * gWick + (beClose ? 15.0 : 0.0) + 20.0 * gDelta + (beProg ? 15.0 : 0.0) + 10.0 * lvlBearF) / aDen
+int   bearConf = (beVol ? 1 : 0) + (beWick ? 1 : 0) + (beClose ? 1 : 0) + (beDelta ? 1 : 0) + (beProg ? 1 : 0) + (beLvl ? 1 : 0)
+bool  bearAbs = bearConf >= absMinConf and bearAbsScore >= absMinScore and (beVol or beDelta) and beClose
+bool  bearAbsStrong = bearAbs and bearAbsScore >= absStrong
+
+// ── Module D: delta / imbalance reading (4 distinct situations) ──────────────────
+bool progUp          = close > open and closePos >= 0.5
+bool buyImbOK        = hasOF and buyRun >= minRun and progUp                                  // 1 buy imbalance + upward progress
+bool buyImbFail      = hasOF and buyRun >= minRun and not progUp                              // 2 buy imbalance, price fails to advance
+bool sellImbProg     = hasOF and sellRun >= minRun and close < open and closePos < 0.45      // 3 sell imbalance + downward progress
+bool sellImbRefuse   = hasOF and sellRun >= minRun and close >= open and closePos >= 0.55    // 4 sell imbalance, price refuses to fall
+float deltaF = hasOF ? (deltaPct >= minDeltaPct ? math.min(1.0, 0.5 + 0.5 * (deltaPct - minDeltaPct) / math.max(minDeltaPct, 1.0)) : 0.0) : na
+float imbF   = hasOF ? ((buyImbOK or sellImbRefuse) ? 1.0 : 0.0) : na
+float fpFrac = hasOF ? 0.5 * deltaF + 0.5 * imbF : na
+
+// ── Module E: impulse detection ──────────────────────────────────────────────────
+float ovl = na(rngS) ? 1.0 : (math.min(high, nz(high[1])) - math.max(low, nz(low[1]))) / rngS
+bool bosUpNow = not na(lastSwingHigh) and close > lastSwingHigh and nz(close[1]) <= lastSwingHigh
+bool bosDnNow = not na(lastSwingLow) and close < lastSwingLow and nz(close[1]) >= lastSwingLow
+bool impBase  = not na(atrV) and not na(rngS) and rng >= impAtr * atrV and bodyAbs / rngS >= impBody
+int  impEvBull = ((not na(rv) and rv >= impRv) ? 1 : 0) + ((hasOF and deltaPct >= minDeltaPct) ? 1 : 0) + ((hasOF and buyRun >= minRun) ? 1 : 0) + (bosUpNow ? 1 : 0) + (ovl <= impOverlap ? 1 : 0)
+int  impEvBear = ((not na(rv) and rv >= impRv) ? 1 : 0) + ((hasOF and deltaPct <= -minDeltaPct) ? 1 : 0) + ((hasOF and sellRun >= minRun) ? 1 : 0) + (bosDnNow ? 1 : 0) + (ovl <= impOverlap ? 1 : 0)
+bool impBullEv = impOn and impBase and close > open and impEvBull >= impMinEv
+bool impBearEv = impOn and impBase and close < open and impEvBear >= impMinEv
+bool impRevisit = impRevisitBull()
+
+// Seeds so that evidence from the 3 bars before a trigger is not lost
+float aAbsSeed = ta.highest(bullAbsF, 3)
+float aFpSeed  = ta.highest(nz(fpFrac, 0.0), 3)
+float aLvlSeed = ta.highest(lvlBullF, 3)
+float aRvSeed  = ta.highest(nz(rv, 0.0), 3)
+
+// ═════════════════════════════════ CONFIRMED-BAR ENGINE ═══════════════════════════
+bool conf = barstate.isconfirmed
+bool buyEvt = false
+bool preEvt = false
+bool trapSellEvt = false
+bool trapBuyEvt = false
+string buyMsg = ""
+string preMsg = ""
+
+if conf
+    // ── 0. update outcome tracking of the latest BUY (conservative: stop checked first) ──
+    int prevSt = sigStatus
+    if sigStatus >= 1 and sigStatus <= 2 and bar_index > sigBar
+        if sigStatus == 1
+            if low <= sigSL
+                sigStatus := 4
+            else if high >= sigT2
+                sigStatus := 3
+            else if high >= sigT1
+                sigStatus := 2
+        else if sigStatus == 2
+            if high >= sigT2
+                sigStatus := 3
+            else if low <= sigSL
+                sigStatus := 5
+
+    if showHits and sigStatus != prevSt
+        if sigStatus == 2 or sigStatus == 3
+            infoLabels.push(label.new(bar_index, high, sigStatus == 3 ? "TP2 ✓" : "TP1 ✓", yloc=yloc.abovebar, style=label.style_label_down, color=color.new(bullC, 20), textcolor=color.white, size=size.tiny, tooltip="Latest BUY reached " + (sigStatus == 3 ? "TP2 " + str.tostring(sigT2, format.mintick) : "TP1 " + str.tostring(sigT1, format.mintick))))
+        else
+            infoLabels.push(label.new(bar_index, low, sigStatus == 5 ? "SL ✗ (after TP1)" : "SL ✗", yloc=yloc.belowbar, style=label.style_label_up, color=color.new(bearC, 20), textcolor=color.white, size=size.tiny, tooltip="Latest BUY stop-loss " + str.tostring(sigSL, format.mintick) + " was touched."))
+    if newSess
+        sessStartBar := bar_index
+    if bullAbs
+        lastBullAbsBar := bar_index
+    if bearAbs
+        lastBearAbsBar := bar_index
+
+    // ── 1. confirmed pivots → swing state + liquidity zones ──────────────────────
+    float wZone = math.max(nz(atrV, 0.0) * heatBinATR, syminfo.mintick * 2.0)
+    if not na(plv)
+        lastSwingLow := plv
+        addPivotZone(zones, plv, 1, bar_index - pivR, nz(rv[pivR], 1.0), wZone)
+    if not na(phv)
+        lastSwingHigh := phv
+        addPivotZone(zones, phv, -1, bar_index - pivR, nz(rv[pivR], 1.0), wZone)
+
+    // ── 2. structure shifts ──────────────────────────────────────────────────────
+    if bosUpNow
+        structDir := 1
+        bosUpBar := bar_index
+    if bosDnNow
+        structDir := -1
+        bosDnBar := bar_index
+
+    // ── 3. zone interaction: touches / absorption count / sweeps ─────────────────
+    float sweepMin = nz(atrV, 0.0) * sweepMinATR
+    float maxDepth = nz(atrV, 0.0) * maxSweepATR
+    float tolNow = nz(atrV, 0.0) * lvlTolATR
+    for z in zones
+        if z.active and bar_index > z.made
+            if z.dir == 1
+                bool inZ = low <= z.lvl + z.w * 0.5 and low >= z.lvl - sweepMin
+                if inZ and close > z.lvl and bar_index - z.lastHit > 3
+                    z.touches := z.touches + 1
+                    z.volSum := z.volSum + nz(rv, 1.0)
+                    z.lastHit := bar_index
+                if bullAbs and not z.swept and touchOK(true, z.lvl, z.w * 0.5, tolNow)
+                    z.absCnt := z.absCnt + 1
+            else
+                bool inZ = high >= z.lvl - z.w * 0.5 and high <= z.lvl + sweepMin
+                if inZ and close < z.lvl and bar_index - z.lastHit > 3
+                    z.touches := z.touches + 1
+                    z.volSum := z.volSum + nz(rv, 1.0)
+                    z.lastHit := bar_index
+                if bearAbs and not z.swept and touchOK(false, z.lvl, z.w * 0.5, tolNow)
+                    z.absCnt := z.absCnt + 1
+
+    // ── 4a. SELL-SIDE sweep → trapped sellers ────────────────────────────────────
+    float evQ = 0.0
+    float evLvl = na
+    float evLow = na
+    if na(pendSLvl)
+        LiqZone bestS = na
+        for z in zones
+            if z.active and not z.swept and z.dir == 1 and bar_index > z.made and low < z.lvl - sweepMin
+                z.swept := true
+                z.deadBar := bar_index
+                if na(bestS) or z.lvl > bestS.lvl
+                    bestS := z
+        if not na(bestS)
+            pendSLvl := bestS.lvl
+            pendSLow := low
+            pendSBar := bar_index
+            pendSZ := bestS
+    if not na(pendSLvl)
+        pendSLow := math.min(pendSLow, low)
+        bool resetS = false
+        if maxDepth > 0 and pendSLvl - pendSLow > maxDepth
+            pendSZ.active := false
+            resetS := true
+        else if close > pendSLvl and (close > open or closePos >= 0.5)
+            trapSellEvt := true
+            bool qBull = close > open
+            bool qAbs = not na(lastBullAbsBar) and lastBullAbsBar >= pendSBar - 1
+            bool qDelta = hasOF and deltaPct > 0
+            float q = hasOF ? 0.40 + (qBull ? 0.15 : 0.0) + (qAbs ? 0.20 : 0.0) + (qDelta ? 0.25 : 0.0) : 0.50 + (qBull ? 0.25 : 0.0) + (qAbs ? 0.25 : 0.0)
+            if pendSZ.touches >= 2
+                q := q + 0.15
+            evQ := math.min(q, 1.0)
+            evLvl := pendSLvl
+            evLow := pendSLow
+            lastTrapSBar := bar_index
+            resetS := true
+        else if bar_index - pendSBar + 1 >= reclaimBars
+            pendSZ.active := false
+            resetS := true
+        if resetS
+            pendSLvl := na
+            pendSLow := na
+            pendSBar := na
+            pendSZ := na
+
+    // ── 4b. BUY-SIDE sweep → trapped buyers (context / warning only) ─────────────
+    if na(pendBLvl)
+        LiqZone bestB = na
+        for z in zones
+            if z.active and not z.swept and z.dir == -1 and bar_index > z.made and high > z.lvl + sweepMin
+                z.swept := true
+                z.deadBar := bar_index
+                if na(bestB) or z.lvl < bestB.lvl
+                    bestB := z
+        if not na(bestB)
+            pendBLvl := bestB.lvl
+            pendBHigh := high
+            pendBBar := bar_index
+            pendBZ := bestB
+    if not na(pendBLvl)
+        pendBHigh := math.max(pendBHigh, high)
+        bool resetB = false
+        if maxDepth > 0 and pendBHigh - pendBLvl > maxDepth
+            pendBZ.active := false
+            resetB := true
+        else if close < pendBLvl and (close < open or closePos <= 0.5)
+            trapBuyEvt := true
+            lastTrapBBar := bar_index
+            resetB := true
+        else if bar_index - pendBBar + 1 >= reclaimBars
+            pendBZ.active := false
+            resetB := true
+        if resetB
+            pendBLvl := na
+            pendBHigh := na
+            pendBBar := na
+            pendBZ := na
+
+    if showTrap and trapSellEvt
+        infoLabels.push(label.new(bar_index, low, "SELLERS TRAPPED", yloc=yloc.belowbar, style=label.style_label_up, color=color.new(bullC, 75), textcolor=color.new(bullC, 0), size=size.tiny, tooltip="Sweep of " + str.tostring(evLvl, format.mintick) + " then close back above. Context only – a BUY still needs confirmation + score."))
+    if showTrap and trapBuyEvt
+        infoLabels.push(label.new(bar_index, high, "BUYERS TRAPPED", yloc=yloc.abovebar, style=label.style_label_down, color=color.new(bearC, 75), textcolor=color.new(bearC, 0), size=size.tiny, tooltip="Break above a high failed and closed back below. Bearish WARNING / context only – no SELL signal is generated."))
+    while infoLabels.size() > 250
+        label.delete(infoLabels.shift())
+
+    // ── 5. impulse zones: update / expire / create ───────────────────────────────
+    int ii = imps.size() - 1
+    while ii >= 0
+        ImpZone iz = imps.get(ii)
+        if iz.state < 2 and bar_index > iz.born
+            bool invalid = false
+            if iz.dir == 1
+                if close < iz.bot
+                    invalid := true
+                else if low <= iz.top and iz.state == 0
+                    iz.state := 1
+                    box.set_bgcolor(iz.bx, color.new(bullC, 88))
+            else
+                if close > iz.top
+                    invalid := true
+                else if high >= iz.bot and iz.state == 0
+                    iz.state := 1
+                    box.set_bgcolor(iz.bx, color.new(bearC, 88))
+            if invalid
+                iz.state := 2
+                iz.deadBar := bar_index
+                box.set_bgcolor(iz.bx, color.new(color.gray, 93))
+                box.set_border_color(iz.bx, color.new(color.gray, 70))
+                box.set_border_style(iz.bx, line.style_dotted)
+                box.set_right(iz.bx, bar_index)
+        bool deadI = (iz.state == 2 and bar_index - iz.deadBar > impDelAfter) or bar_index - iz.born > impExtend
+        if deadI
+            box.delete(iz.bx)
+            imps.remove(ii)
+        ii := ii - 1
+
+    if impBullEv
+        float zt = low + math.max(math.min(open - low, 0.6 * rng), 0.25 * rng)
+        box zb = box.new(bar_index, zt, bar_index + impExtend, low, border_color=color.new(bullC, 40), bgcolor=color.new(bullC, 80), border_width=1, text="Bull impulse", text_size=size.tiny, text_color=color.new(bullC, 20), text_halign=text.align_left)
+        imps.push(ImpZone.new(top = zt, bot = low, dir = 1, born = bar_index, bx = zb))
+    if impBearEv
+        float zbm = high - math.max(math.min(high - open, 0.6 * rng), 0.25 * rng)
+        box zb2 = box.new(bar_index, high, bar_index + impExtend, zbm, border_color=color.new(bearC, 40), bgcolor=color.new(bearC, 80), border_width=1, text="Bear impulse", text_size=size.tiny, text_color=color.new(bearC, 20), text_halign=text.align_left)
+        imps.push(ImpZone.new(top = high, bot = zbm, dir = -1, born = bar_index, bx = zb2))
+    while imps.size() > impMax
+        ImpZone oldZ = imps.shift()
+        box.delete(oldZ.bx)
+
+    // ── 6. approximate rolling volume profile ────────────────────────────────────
+    if vpOn and bar_index % vpEvery == 0
+        int lb = vpSession ? math.min(bar_index - sessStartBar + 1, vpLookback) : vpLookback
+        lb := math.min(lb, bar_index + 1)
+        if lb >= 20
+            float hiP = high
+            float loP = low
+            for k = 1 to lb - 1
+                hiP := math.max(hiP, high[k])
+                loP := math.min(loP, low[k])
+            if hiP > loP
+                float bsz = math.max((hiP - loP) / vpBins, syminfo.mintick * vpTickMult)
+                int nb = math.max(1, int(math.ceil((hiP - loP) / bsz)))
+                array<float> v = array.new<float>(nb, 0.0)
+                for k = 0 to lb - 1
+                    float hk = high[k]
+                    float lk = low[k]
+                    float ck = close[k]
+                    float vk = nz(volume[k])
+                    int b0 = binOf(lk, loP, bsz, nb)
+                    int b1 = binOf(hk, loP, bsz, nb)
+                    float uniPart = vpMethod == "Uniform" ? vk : vk * 0.5
+                    float share = uniPart / (b1 - b0 + 1)
+                    for b = b0 to b1
+                        v.set(b, v.get(b) + share)
+                    if vpMethod != "Uniform"
+                        float anchor = vpMethod == "Close-weighted" ? ck : (hk + lk + ck) / 3.0
+                        int cb = binOf(anchor, loP, bsz, nb)
+                        v.set(cb, v.get(cb) + vk * 0.5)
+                float total = v.sum()
+                if total > 0
+                    int pIdx = v.indexof(v.max())
+                    int loI = pIdx
+                    int hiI = pIdx
+                    float acc = v.get(pIdx)
+                    float target = total * vpVA / 100.0
+                    while acc < target and (loI > 0 or hiI < nb - 1)
+                        float upV = hiI < nb - 1 ? v.get(hiI + 1) : -1.0
+                        float dnV = loI > 0 ? v.get(loI - 1) : -1.0
+                        if upV >= dnV
+                            hiI := hiI + 1
+                            acc := acc + upV
+                        else
+                            loI := loI - 1
+                            acc := acc + dnV
+                    float avgB = total / nb
+                    array<float> cP = array.new<float>()
+                    array<float> cV = array.new<float>()
+                    for b = 0 to nb - 1
+                        float vb = v.get(b)
+                        if vb > 0 and vb >= avgB * hvnMinRel
+                            bool isMax = true
+                            for d = -2 to 2
+                                int nbi = b + d
+                                if d != 0 and nbi >= 0 and nbi < nb
+                                    float vn = v.get(nbi)
+                                    if vn > vb or (vn == vb and d < 0)
+                                        isMax := false
+                            if isMax
+                                cP.push(loP + (b + 0.5) * bsz)
+                                cV.push(vb / avgB)
+                    hvnPrices.clear()
+                    hvnRel.clear()
+                    int pickN = math.min(hvnN, cP.size())
+                    if pickN > 0
+                        for q = 1 to pickN
+                            int mi = cV.indexof(cV.max())
+                            hvnPrices.push(cP.get(mi))
+                            hvnRel.push(cV.get(mi))
+                            cP.remove(mi)
+                            cV.remove(mi)
+                    pocP := loP + (pIdx + 0.5) * bsz
+                    vahP := loP + (hiI + 1) * bsz
+                    valP := loP + loI * bsz
+                    vpBin := bsz
+                    vpLbUsed := lb
+
+    // ── 7. liquidity-zone maintenance: score / qualify / expire ──────────────────
+    array<float> qs = array.new<float>()
+    int zi = zones.size() - 1
+    while zi >= 0
+        LiqZone z = zones.get(zi)
+        bool kill = (z.swept and bar_index - z.deadBar > 30) or (bar_index - z.lastHit > heatExpiry)
+        if kill
+            if not na(z.bx)
+                box.delete(z.bx)
+            zones.remove(zi)
+        else
+            z.eq := z.touches >= 2
+            float avgRvZ = z.volSum / math.max(z.touches, 1)
+            float confl = 0.0
+            if vpOn
+                float rad = nz(vpBin, 0.0) + z.w
+                float vEdge = z.dir == 1 ? valP : vahP
+                if (not na(pocP) and math.abs(z.lvl - pocP) <= rad) or (not na(vEdge) and math.abs(z.lvl - vEdge) <= rad)
+                    confl := 20.0
+                for h in hvnPrices
+                    if math.abs(z.lvl - h) <= rad
+                        confl := 20.0
+            z.score := math.min(z.touches / 4.0, 1.0) * 35.0 + math.min(avgRvZ / 2.0, 1.0) * 25.0 + confl + math.min(z.absCnt, 2) / 2.0 * 10.0 + (z.swept ? 0.0 : 10.0)
+            z.qual := z.active and not z.swept and z.touches >= heatMinTouch and avgRvZ >= heatMinVol and z.score >= heatMinScore
+            if z.qual
+                z.wasQual := true
+                qs.push(z.score)
+        zi := zi - 1
+    while zones.size() > 40
+        int worst = 0
+        float worstS = 1e10
+        for j = 0 to zones.size() - 1
+            LiqZone zz = zones.get(j)
+            float zkey = zz.score + (zz.qual ? 1000.0 : 0.0)
+            if zkey < worstS
+                worstS := zkey
+                worst := j
+        LiqZone wz = zones.remove(worst)
+        if not na(wz.bx)
+            box.delete(wz.bx)
+
+    float thr = -1.0
+    if qs.size() >= heatMax
+        qs.sort(order.descending)
+        thr := qs.get(heatMax - 1)
+    for z in zones
+        bool showZ = showHeat and ((z.qual and z.score >= thr) or (z.swept and z.wasQual))
+        if showZ
+            color baseC = (z.absCnt > 0 and not z.swept) ? absorbC : (z.dir == 1 ? sellLiqC : buyLiqC)
+            float trn = z.swept ? 93.0 : math.max(35.0, 90.0 - z.score * 0.55)
+            if na(z.bx)
+                z.bx := box.new(z.born, z.lvl + z.w * 0.5, bar_index, z.lvl - z.w * 0.5, border_color=color.new(baseC, math.max(trn - 25.0, 0.0)), bgcolor=color.new(baseC, trn), extend=extend.right)
+            else
+                box.set_bgcolor(z.bx, color.new(baseC, trn))
+                box.set_border_color(z.bx, color.new(baseC, math.max(trn - 25.0, 0.0)))
+            if z.swept and not z.fin
+                box.set_extend(z.bx, extend.none)
+                box.set_right(z.bx, z.deadBar)
+                z.fin := true
+        else if not na(z.bx)
+            box.delete(z.bx)
+            z.bx := na
+
+    // ── 8. BUY engine: arm → confirm → score → signal ────────────────────────────
+    if armed and bar_index - armStart > setupWin
+        armed := false
+    bool trigger = trapSellEvt or bullAbs
+    if trigger
+        if not armed
+            armed := true
+            armStart := bar_index
+            armAbsF := aAbsSeed
+            armFpF := aFpSeed
+            armLvlF := aLvlSeed
+            armRv := aRvSeed
+            armSweepF := 0.0
+            armImp := false
+            armLvl := na
+            armLow := low
+        armBar := bar_index
+        armHigh := high
+        if trapSellEvt
+            armSweepF := math.max(armSweepF, evQ)
+            armLvl := evLvl
+            armLow := math.min(armLow, evLow)
+    if armed
+        armAbsF := math.max(armAbsF, bullAbsF)
+        armFpF := math.max(armFpF, nz(fpFrac, 0.0))
+        armLvlF := math.max(armLvlF, lvlBullF)
+        armRv := math.max(armRv, nz(rv, 0.0))
+        armImp := armImp or impRevisit or impBullEv
+        armLow := math.min(armLow, low)
+
+        bool structNow = not na(bosUpBar) and bosUpBar >= armStart
+        float structF = structNow ? 1.0 : (close > armHigh ? 0.6 : 0.0)
+        float volFr = math.min(1.0, 0.5 * math.min(armRv / 2.0, 1.0) + (armImp ? 0.5 : 0.0))
+        float availW = wAbs + wSweep + (hasOF ? wFp : 0) + wLvl + wStruct + wVol
+        float gotW = wAbs * armAbsF + wSweep * armSweepF + (hasOF ? wFp * armFpF : 0.0) + wLvl * armLvlF + wStruct * structF + wVol * volFr
+        float score = availW > 0 ? 100.0 * gotW / availW : 0.0
+        liveScore := score
+        int evid = (armAbsF >= evMin ? 1 : 0) + (armSweepF >= evMin ? 1 : 0) + ((hasOF and armFpF >= evMin) ? 1 : 0) + (armLvlF >= evMin ? 1 : 0) + (structF >= evMin ? 1 : 0) + (volFr >= evMin ? 1 : 0)
+
+        if bar_index > armBar
+            bool paOK = close > armHigh or bosUpNow
+            bool reclaimOK = na(armLvl) or close > armLvl
+            bool candleOK = not requireBull or close > open
+            bool cdOK = na(lastBuyBar) or bar_index - lastBuyBar >= cooldown
+            bool sweepOK = not requireSweep or armSweepF > 0
+            bool impOK = not (noBearImb and sellImbProg)
+            float entry = close
+            float sl = armLow - slBuf * nz(atrV, 0.0)
+            float risk = entry - sl
+            bool riskOK = risk > syminfo.mintick and (na(atrV) or risk <= maxRiskATR * atrV)
+            if paOK and reclaimOK and candleOK and cdOK and sweepOK and impOK and riskOK and htfOK and score >= buyThr and evid >= minEvid
+                buyEvt := true
+                float t1 = entry + rr1 * risk
+                float t2 = entry + rr2 * risk
+                string rs = ""
+                if armAbsF >= evMin
+                    rs := rs + "ABS"
+                if armSweepF >= evMin
+                    rs := rs + (rs == "" ? "" : "+") + "SWEEP"
+                if hasOF and armFpF >= evMin
+                    rs := rs + (rs == "" ? "" : "+") + fpTag
+                if armLvlF >= evMin
+                    rs := rs + (rs == "" ? "" : "+") + "LVL"
+                if structF >= evMin
+                    rs := rs + (rs == "" ? "" : "+") + "MSS"
+                if volFr >= evMin
+                    rs := rs + (rs == "" ? "" : "+") + "VOL"
+                string tip = "Confirmed BUY  |  Score " + str.tostring(score, "#") + "/100 (rule-based, not a probability)" + "\nEntry ref: " + str.tostring(entry, format.mintick) + "\nStop: " + str.tostring(sl, format.mintick) + "\nT1 (" + str.tostring(rr1) + "R): " + str.tostring(t1, format.mintick) + "\nT2 (" + str.tostring(rr2) + "R): " + str.tostring(t2, format.mintick) + "\nComponents  ABS " + str.tostring(armAbsF * 100, "#") + " · SWEEP " + str.tostring(armSweepF * 100, "#") + " · FLOW " + (hasOF ? str.tostring(armFpF * 100, "#") : "n/a") + " · LVL " + str.tostring(armLvlF * 100, "#") + " · STRUCT " + str.tostring(structF * 100, "#") + " · VOL " + str.tostring(volFr * 100, "#") + "\nVolume: " + str.tostring(volume, format.volume) + " (" + (na(rv) ? "n/a" : str.tostring(rv, "#.##") + "× avg") + ")" + "\nData: " + dataLabel + "\nReference levels only – not guaranteed execution prices."
+                string lblTxt = "BUY " + str.tostring(score, "#")
+                if labelMode == "Full (entry / SL / TP)"
+                    lblTxt := lblTxt + "\nEntry " + str.tostring(entry, format.mintick) + "\nSL " + str.tostring(sl, format.mintick) + "\nTP1 " + str.tostring(t1, format.mintick) + "\nTP2 " + str.tostring(t2, format.mintick)
+                if showReasons
+                    lblTxt := lblTxt + "\n" + rs
+                buyLabels.push(label.new(bar_index, low, lblTxt, yloc=yloc.belowbar, style=label.style_label_up, color=bullC, textcolor=color.white, size=size.normal, tooltip=tip))
+                while buyLabels.size() > 150
+                    label.delete(buyLabels.shift())
+                if showRisk
+                    int x2 = bar_index + lineBars
+                    sigLines.push(line.new(bar_index, entry, x2, entry, color=color.new(color.white, 20), style=line.style_solid, width=1))
+                    sigLines.push(line.new(bar_index, sl, x2, sl, color=bearC, style=line.style_solid, width=1))
+                    sigLines.push(line.new(bar_index, t1, x2, t1, color=bullC, style=line.style_dashed, width=1))
+                    sigLines.push(line.new(bar_index, t2, x2, t2, color=bullC, style=line.style_dotted, width=1))
+                    lvlLabels.push(label.new(x2, entry, "Entry " + str.tostring(entry, format.mintick), style=label.style_none, textcolor=color.silver, size=size.small))
+                    lvlLabels.push(label.new(x2, sl, "SL " + str.tostring(sl, format.mintick), style=label.style_none, textcolor=bearC, size=size.small))
+                    lvlLabels.push(label.new(x2, t1, "TP1 " + str.tostring(t1, format.mintick), style=label.style_none, textcolor=bullC, size=size.small))
+                    lvlLabels.push(label.new(x2, t2, "TP2 " + str.tostring(t2, format.mintick), style=label.style_none, textcolor=bullC, size=size.small))
+                    if showRRBox
+                        sigBoxes.push(box.new(bar_index, t2, x2, entry, border_color=color.new(color.white, 100), bgcolor=color.new(bullC, 88)))
+                        sigBoxes.push(box.new(bar_index, entry, x2, sl, border_color=color.new(color.white, 100), bgcolor=color.new(bearC, 88)))
+                    while sigBoxes.size() > maxSig * 2
+                        box.delete(sigBoxes.shift())
+                    while sigLines.size() > maxSig * 4
+                        line.delete(sigLines.shift())
+                    while lvlLabels.size() > maxSig * 4
+                        label.delete(lvlLabels.shift())
+                sigEntry := entry
+                sigSL := sl
+                sigT1 := t1
+                sigT2 := t2
+                sigBar := bar_index
+                sigStatus := 1
+                lastBuyBar := bar_index
+                lastScore := score
+                liveScore := na
+                armed := false
+                buyMsg := "IOFLR BUY | " + syminfo.ticker + " " + timeframe.period + " | Entry " + str.tostring(entry, format.mintick) + " | SL " + str.tostring(sl, format.mintick) + " | T1 " + str.tostring(t1, format.mintick) + " | T2 " + str.tostring(t2, format.mintick) + " | Score " + str.tostring(score, "#") + " | Vol " + str.tostring(volume, format.volume) + " (" + (na(rv) ? "n/a" : str.tostring(rv, "#.##") + "x") + ") | " + rs
+    if not armed
+        liveScore := na
+
+    // ── 9. preliminary events (never a BUY) ──────────────────────────────────────
+    preEvt := trapSellEvt or bullAbsStrong
+    if preEvt
+        preMsg := "IOFLR preliminary: " + (trapSellEvt ? "Sellers trapped" : "Strong bullish absorption") + " | " + syminfo.ticker + " " + timeframe.period + " | NOT a confirmed BUY"
+
+if buyEvt and alertDyn
+    alert(buyMsg, alert.freq_once_per_bar_close)
+if preEvt and alertPreDyn
+    alert(preMsg, alert.freq_once_per_bar_close)
+
+alertcondition(buyEvt, "IOFLR · Confirmed BUY", "IOFLR confirmed BUY on {{ticker}} ({{interval}}) · entry ref {{close}}. Check the chart for stop, targets and score.")
+alertcondition(preEvt, "IOFLR · Preliminary: strong absorption / sellers trapped", "IOFLR preliminary event on {{ticker}} ({{interval}}) – NOT a confirmed BUY.")
+
+// ═════════════════════════════════════════ PLOTS ══════════════════════════════════
+plotshape(showAbs and conf and bullAbsStrong, "Strong bullish absorption", shape.triangleup, location.belowbar, color.new(absorbC, 10), size=size.tiny, text="ABS", textcolor=color.new(absorbC, 10))
+plotshape(showAbs and conf and bearAbsStrong, "Bearish absorption (context only)", shape.triangledown, location.abovebar, color.new(bearC, 40), size=size.tiny, text="ABS", textcolor=color.new(bearC, 40))
+
+// ── Volume columns (drawn inside the price pane, scaled to the bottom) ──
+float vBase  = ta.lowest(low, volScaleLb)
+float vSpan  = (ta.highest(high, volScaleLb) - vBase) * volHeight / 100.0
+float vMax   = ta.highest(volume, volScaleLb)
+float vTop   = vMax > 0 ? vBase + vSpan * nz(volume) / vMax : na
+float vSplit = (hasOF and totOF > 0) ? vBase + (vTop - vBase) * buyShare : (close >= open ? vTop : vBase)
+bool  vSpike = not na(rv) and rv >= volHiRv
+int   vTr    = vSpike ? 25 : 60
+
+color cBuy  = color.new(bullC, vTr)
+color cSell = color.new(bearC, vTr)
+
+// lower part = buy volume (or whole bar if candle is up and no order-flow data)
+plotcandle(showVol ? vBase : na, showVol ? vSplit : na, showVol ? vBase : na, showVol ? vSplit : na, title="Buy volume", color=cBuy, wickcolor=cBuy, bordercolor=cBuy, display=display.pane)
+// upper part = sell volume (or whole bar if candle is down and no order-flow data)
+plotcandle(showVol ? vSplit : na, showVol ? vTop : na, showVol ? vSplit : na, showVol ? vTop : na, title="Sell volume", color=cSell, wickcolor=cSell, bordercolor=cSell, display=display.pane)
+// average-volume line
+plot(showVol and vMax > 0 ? vBase + vSpan * nz(avgVol) / vMax : na, "Avg volume", color=color.new(color.white, 40), display=display.pane)
+
+// ═════════════════════════ PROFILE DRAWINGS (last bar only) ═══════════════════════
+if barstate.islast and showProfile and vpOn and not na(pocP)
+    int xL = math.max(0, bar_index - vpLbUsed + 1)
+    if na(pocLn)
+        pocLn := line.new(xL, pocP, bar_index, pocP, color=pocC, width=2, extend=extend.right)
+        vahLn := line.new(xL, vahP, bar_index, vahP, color=vaC, style=line.style_dashed, extend=extend.right)
+        valLn := line.new(xL, valP, bar_index, valP, color=vaC, style=line.style_dashed, extend=extend.right)
+    else
+        line.set_xy1(pocLn, xL, pocP)
+        line.set_xy2(pocLn, bar_index, pocP)
+        line.set_xy1(vahLn, xL, vahP)
+        line.set_xy2(vahLn, bar_index, vahP)
+        line.set_xy1(valLn, xL, valP)
+        line.set_xy2(valLn, bar_index, valP)
+    for bx in hvnBoxes
+        box.delete(bx)
+    hvnBoxes.clear()
+    for h in hvnPrices
+        float hh = nz(vpBin, syminfo.mintick) * 0.5
+        hvnBoxes.push(box.new(xL, h + hh, bar_index, h - hh, border_color=color.new(hvnC, 50), bgcolor=color.new(hvnC, 85), extend=extend.right, text="HVN", text_size=size.tiny, text_color=color.new(hvnC, 20), text_halign=text.align_right))
+
+// ═════════════════════════════════════════ DASHBOARD ══════════════════════════════
+setRow(int r, string k, string val, color c) =>
+    table.cell(dash, 0, r, k, text_color=color.new(color.gray, 0), text_halign=text.align_left, text_size=dashSizeStr == "Tiny" ? size.tiny : dashSizeStr == "Normal" ? size.normal : size.small, bgcolor=color.new(color.black, 25))
+    table.cell(dash, 1, r, val, text_color=c, text_halign=text.align_left, text_size=dashSizeStr == "Tiny" ? size.tiny : dashSizeStr == "Normal" ? size.normal : size.small, bgcolor=color.new(color.black, 25))
+
+if barstate.islast and showDash
+    string posStr = switch dashPosStr
+        "Top Left" => position.top_left
+        "Bottom Left" => position.bottom_left
+        "Bottom Right" => position.bottom_right
+        => position.top_right
+    if na(dash)
+        dash := table.new(posStr, 2, 20, border_width=1, border_color=color.new(color.gray, 60), frame_color=color.new(color.gray, 40), frame_width=1)
+    color neutral = color.new(color.silver, 0)
+    setRow(0, "IOFLR", "Order Flow & Liquidity Radar", color.white)
+    setRow(1, "Data mode", dataLabel, hasOF ? bullC : color.orange)
+
+    string biasTxt = structDir == 1 ? "Bullish (structure)" : structDir == -1 ? "Bearish (structure)" : "Neutral"
+    if htfOn and not na(htfEma)
+        biasTxt := biasTxt + (close > htfEma ? " · HTF ↑" : " · HTF ↓")
+    setRow(2, "Market bias", biasTxt, structDir == 1 ? bullC : structDir == -1 ? bearC : neutral)
+
+    string absTxt = (not na(lastBullAbsBar) and bar_index - lastBullAbsBar <= 5) ? "Bullish ABS (" + str.tostring(bar_index - lastBullAbsBar) + "b ago)" : (not na(lastBearAbsBar) and bar_index - lastBearAbsBar <= 5) ? "Bearish ABS (" + str.tostring(bar_index - lastBearAbsBar) + "b ago)" : "None recent"
+    setRow(3, "Absorption", absTxt, str.contains(absTxt, "Bullish") ? bullC : str.contains(absTxt, "Bearish") ? bearC : neutral)
+
+    string trapTxt = (not na(lastTrapSBar) and bar_index - lastTrapSBar <= 8) ? "Sellers trapped (" + str.tostring(bar_index - lastTrapSBar) + "b ago)" : (not na(lastTrapBBar) and bar_index - lastTrapBBar <= 8) ? "Buyers trapped (" + str.tostring(bar_index - lastTrapBBar) + "b ago)" : "None recent"
+    setRow(4, "Trapped traders", trapTxt, str.contains(trapTxt, "Sellers") ? bullC : str.contains(trapTxt, "Buyers") ? bearC : neutral)
+
+    string dTxt = hasOF ? (deltaPct >= 0 ? "▲ +" : "▼ ") + str.tostring(deltaPct, "#.#") + "% · buyRun " + str.tostring(buyRun) + " / sellRun " + str.tostring(sellRun) + (str.contains(dataLabel, "pprox") ? " (approx.)" : "") : "N/A"
+    setRow(5, "Delta / imbalance", dTxt, not hasOF ? neutral : deltaPct >= 0 ? bullC : bearC)
+
+    setRow(6, "POC ≈ (rolling)", na(pocP) ? "N/A" : str.tostring(pocP, format.mintick) + (not na(fpPoc) ? "  · bar fpPOC " + str.tostring(fpPoc, format.mintick) : ""), pocC)
+    setRow(7, "VAH / VAL ≈", na(vahP) ? "N/A" : str.tostring(vahP, format.mintick) + " / " + str.tostring(valP, format.mintick), vaC)
+
+    string hvnTxt = "none"
+    if hvnPrices.size() > 0
+        hvnTxt := ""
+        for h in hvnPrices
+            hvnTxt := hvnTxt + (hvnTxt == "" ? "" : " · ") + str.tostring(h, format.mintick)
+    setRow(8, "HVN ≈", hvnTxt, hvnC)
+
+    LiqZone nearZ = na
+    float nearD = 1e10
+    for z in zones
+        if z.qual and not z.swept
+            float dd = math.abs(close - z.lvl)
+            if dd < nearD
+                nearD := dd
+                nearZ := z
+    string nzTxt = "none qualified"
+    color nzCol = neutral
+    if not na(nearZ)
+        nzTxt := (nearZ.dir == 1 ? "Sell-side " : "Buy-side ") + str.tostring(nearZ.lvl, format.mintick) + " · score " + str.tostring(nearZ.score, "#") + " · est."
+        nzCol := nearZ.dir == 1 ? sellLiqC : buyLiqC
+    setRow(9, "Nearest est. liquidity", nzTxt, nzCol)
+
+    string impTxt = "none"
+    for z in imps
+        if z.dir == 1 and z.state < 2
+            impTxt := str.tostring(z.bot, format.mintick) + "–" + str.tostring(z.top, format.mintick) + (z.state == 0 ? " (untested)" : " (revisited)")
+    setRow(10, "Bull impulse zone", impTxt, impTxt == "none" ? neutral : bullC)
+
+    string scTxt = armed and not na(liveScore) ? "Armed · " + str.tostring(liveScore, "#") + " / need " + str.tostring(buyThr) : not na(lastScore) ? "Last " + str.tostring(lastScore, "#") + " (threshold " + str.tostring(buyThr) + ")" : "— (no active setup)"
+    setRow(11, "BUY confluence", scTxt, armed ? color.yellow : neutral)
+
+    bool hasSig = not na(lastBuyBar)
+    color stCol = sigStatus == 3 ? bullC : sigStatus == 2 ? color.lime : sigStatus == 4 or sigStatus == 5 ? bearC : sigStatus == 1 ? color.yellow : neutral
+    setRow(12, "Latest BUY", hasSig ? statusTxt(sigStatus) + " · " + str.tostring(bar_index - sigBar) + " bars ago" : "none yet", stCol)
+    setRow(13, "Entry price", hasSig ? str.tostring(sigEntry, format.mintick) : "—", color.white)
+    setRow(14, "Stop-loss", hasSig ? str.tostring(sigSL, format.mintick) + "  (−" + str.tostring((sigEntry - sigSL) / sigEntry * 100, "#.##") + "%)" : "—", bearC)
+    setRow(15, "Profit TP1 / TP2", hasSig ? str.tostring(sigT1, format.mintick) + " / " + str.tostring(sigT2, format.mintick) : "—", bullC)
+    setRow(16, "Risk : Reward", hasSig ? "1 : " + str.tostring(rr1) + "  /  1 : " + str.tostring(rr2) : "—", neutral)
+
+    // ── Volume rows ──
+    setRow(17, "Volume", str.tostring(volume, format.volume) + " · avg " + str.tostring(avgVol, format.volume), (not na(rv) and rv >= volHiRv) ? color.yellow : neutral)
+    setRow(18, "Relative volume", na(rv) ? "N/A" : str.tostring(rv, "#.##") + "×" + (rv >= absRelVol ? "  (high)" : rv < 0.7 ? "  (low)" : ""), (not na(rv) and rv >= absRelVol) ? color.yellow : neutral)
+    setRow(19, "Buy / Sell volume", hasOF ? str.tostring(buyVol, format.volume) + " / " + str.tostring(sellVol, format.volume) + (str.contains(dataLabel, "pprox") ? " (est.)" : "") : "N/A", not hasOF ? neutral : buyVol >= sellVol ? bullC : bearC)

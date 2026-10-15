@@ -1,0 +1,10 @@
+{
+  "embedding_model": "all-MiniLM-L6-v2",
+  "dimension": 384,
+  "vector_count": 3,
+  "documents": [
+    "account_security.txt",
+    "refund_policy.txt",
+    "shipping_policy.txt"
+  ]
+}

@@ -1,0 +1,3 @@
+Northstar Demo Store account security
+
+Customers can enable two-step verification from Account Settings under Security. If a customer loses access to their verification device, they should contact support and provide the account email for identity verification. Support never asks customers to send their password.
